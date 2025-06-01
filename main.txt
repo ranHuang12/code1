@@ -1,0 +1,1367 @@
+import os
+import pickle
+from copy import deepcopy
+import cupy
+import calendar
+import sys
+import torch
+import time
+from osgeo import gdal, gdalconst, ogr
+from multiprocessing import Manager, Process
+from multiprocessing.pool import Pool
+from torch import nn
+#from sklearn.metrics import r2_score, mean_absolute_error, root_mean_squared_error
+from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.model_selection import train_test_split
+from datetime import datetime, timedelta, date
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+import pandas as pd
+from enum import Enum
+from osgeo import gdalconst
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression, Lasso
+from sklearn.svm import SVR
+from xgboost import XGBRegressor
+
+from common_object.entity import Accuracy
+#from common_object.enum import ViewEnum, ModelEnum, ValidateModeEnum, QcModeEnum, NodataEnum, ColumnsEnum
+#from common_util.common import get_world_tile, convert_enum_to_value, exclude_finished_tile, build_modeling_x_list, \
+    #concurrent_execute_using_pool
+#from common_util.date import get_all_modis_date_by_year
+#from common_util.document import to_csv, merge_csv, handle_null
+#from common_util.image import read_raster, create_raster
+#from common_util.path import create_path
+#from ta_estimate.core.general_executor import GeneralExecutor
+#from ta_estimate.entity import Path
+# from ta_estimate.entity.configuration import Configuration
+#from ta_estimate.module.cnn import CNN
+#from ta_estimate.module.cnn_lstm import CNNLSTM
+#from ta_estimate.module.cnn_lstm_attn import CNNLSTMAttention
+#from ta_estimate.module.fc import FC
+#from common_util.array.array_util import build_modeling_arr_from_df
+#from ta_estimate.entity.dataset import Dataset
+
+
+def root_mean_squared_error(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred)**2))
+
+def convert_enum_to_value(enum_list):
+    return [enum.value for enum in enum_list]
+
+def exclude_from_csv(value_list, csv_file, field):
+    value_df = pd.read_csv(csv_file)
+    value_df = value_df[value_df[field].notnull()]
+    return list(np.setdiff1d(np.array(value_list), value_df[field].values))   # 使用NumPy库的setdiff1d函数找到两个数组之间的差集。具体来说，它从给定的值列表中排除了那些已经存在于CSV文件的特定字段中的值，并返回结果作为一个列表。
+
+def exclude_finished_tile(tile_list, field, finish_csv, finish_part_csv=None):
+    if finish_part_csv is not None and os.path.isfile(finish_part_csv):
+        return exclude_from_csv(tile_list, finish_part_csv, "tile")
+    elif os.path.isfile(finish_csv):
+        if str(field) in pd.read_csv(finish_csv).columns:
+            return exclude_from_csv(tile_list, finish_csv, "tile")
+    return tile_list
+
+def build_modeling_x_list(view_list, qc_mode, auxiliary_list):
+    modeling_x_list = []
+    for view in view_list:
+        modeling_x_list.append(f"{view.view_name}_{qc_mode.field}")
+        if "ANGLE" in auxiliary_list:
+            modeling_x_list.append(f"{view.view_name}_ANGLE")
+    modeling_x_list.extend(auxiliary_list)
+    if "ANGLE" in auxiliary_list:
+        modeling_x_list.remove("ANGLE")
+    return modeling_x_list
+
+def concurrent_execute(func, args_list, pool_size=1, use_lock=True):
+    pool = Pool(pool_size, )
+    lock = Manager().Lock()
+    results = None
+    for args in args_list:
+        if pool_size == 1:
+            func(*args) if isinstance(args, list) else func(**args)
+        else:
+            if use_lock:
+                if isinstance(args, list):
+                    args.append(lock)
+                else:
+                    args["lock"] = lock
+            results = pool.apply_async(func, args) if isinstance(args, list) else pool.apply_async(func, kwds=args)
+    pool.close()
+    pool.join()
+    try:
+        if results is not None:
+            results.get()
+    except Exception as e:
+        print(e)
+
+class ModisDate(object):
+    def __init__(self):
+        self.py_date = None
+
+    def __fill_field(self):
+        self.year = self.py_date.year
+        self.month = self.py_date.month
+        self.day = self.py_date.day
+        self.doy = self.py_date.timetuple().tm_yday
+        self.modis_date = self.year * 1000 + self.doy
+        self.eight_bit_date = self.year * 10000 + self.month * 100 + self.day
+        return self
+
+    def parse_datetime_date(self, py_date):
+        self.py_date = py_date
+        return self.__fill_field()
+
+    def parse_modis_date(self, modis_date):
+        modis_date = int(modis_date)
+        self.py_date = date(modis_date // 1000, 1, 1) + timedelta(modis_date % 1000 - 1)
+        return self.__fill_field()
+
+    def parse_year_month_day(self, year, month, day):
+        self.py_date = date(year, month, day)
+        return self.__fill_field()
+
+    def parse_eight_bit_date(self, eight_bit_date):
+        eight_bit_date = int(eight_bit_date)
+        return self.parse_year_month_day(eight_bit_date // 10000, (eight_bit_date % 10000) // 100, eight_bit_date % 100)
+
+    def parse_separated_date(self, separated_date, separator):
+        year, month, day = str(separated_date).split(separator)
+        return self.parse_year_month_day(int(year), int(month), int(day))
+
+    def to_separated_date(self, separator):
+        return f"{self.year}{separator}{str(self.month).zfill(2)}{separator}{str(self.day).zfill(2)}"
+
+    def __str__(self):
+        return f"{self.modis_date} {self.eight_bit_date}"
+
+def get_day_num_by_year(year):
+    return 366 if calendar.isleap(year) else 365
+
+def get_all_modis_date_by_year(year, start_doy=1, end_doy=366):
+    year = int(year)
+    start_doy = int(start_doy)
+    end_doy = int(end_doy)
+    return [ModisDate().parse_datetime_date(date(year, 1, 1) + timedelta(doy)) for doy in range(start_doy - 1, min(get_day_num_by_year(year), end_doy))]
+
+
+
+def to_csv(df, csv_file, append=True, lock=None):
+    create_path(os.path.dirname(csv_file))
+    if sys.platform.startswith("linux"):
+        return __to_csv_for_linux(df, csv_file, append)
+    while True:
+        try:
+            if lock is not None:
+                lock.acquire()
+            if append and os.path.isfile(csv_file):    # 如果追加模式且文件存在,header=False：不写入表头。
+                df.to_csv(csv_file, mode="a", index=False, header=False, encoding="utf-8")
+            else:
+                df.to_csv(csv_file, index=False, encoding="utf-8") # 覆盖写入
+            return True
+        except Exception as e:
+            print(e)
+            time.sleep(1)
+        finally:
+            if lock is not None:
+                lock.release()
+
+def __to_csv_for_linux(df, csv_file, append=True):
+    import fcntl
+    while True:
+        with open(csv_file, "a") as file:
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX)
+                if append and os.path.getsize(csv_file) != 0:
+                    df.to_csv(csv_file, mode="a", index=False, header=False)
+                else:
+                    df.to_csv(csv_file, index=False)
+                return True
+            except Exception as e:
+                print(e)
+                time.sleep(1)
+            finally:
+                fcntl.flock(file, fcntl.LOCK_UN)
+
+def merge_csv(csv1, csv2, on=None, how="inner", output_file=None, along_column=True):
+    df1 = csv1 if isinstance(csv1, pd.DataFrame) else (pd.read_csv(csv1) if os.path.isfile(csv1) else None)
+    df2 = csv2 if isinstance(csv2, pd.DataFrame) else (pd.read_csv(csv2) if os.path.isfile(csv2) else None)
+    if df1 is not None and df2 is not None:
+        output_df = df1.merge(df2, how, on) if along_column else pd.concat([df1, df2], ignore_index=True)
+    elif df1 is not None:
+        output_df = df1
+    elif df2 is not None:
+        output_df = df2
+    else:
+        output_df = None
+    if output_df is not None:
+        to_csv(output_df, csv1 if output_file is None else output_file, False)
+
+def handle_null(df: pd.DataFrame(), field_list, keep=False):   # 根据给定的字段列表，从 DataFrame 中删除包含空值（NaN）或非空值的行。根据 keep 参数的值，函数会保留空值行或非空值行
+    for field in field_list:
+        if field in df.columns:
+            if keep:
+                df = df[df[field].isnull()]
+            else:
+                df = df[df[field].notnull()]
+    return df
+
+
+class GeoData(object):
+    def __init__(self, projection, transform):
+        self.projection = projection
+        self.transform = transform
+
+def read_raster(file, get_arr=True, scale_factor=0, arr_type=None):
+    ds = gdal.Open(file)
+    proj = ds.GetProjection()
+    transform = ds.GetGeoTransform()
+    geo_data = GeoData(proj, transform)
+    if get_arr:
+        arr = ds.GetRasterBand(1).ReadAsArray()
+        if scale_factor != 0:
+            arr *= scale_factor
+        if arr_type is not None:
+            arr = arr.astype(arr_type)
+        return arr, geo_data
+    return ds, geo_data
+
+def create_raster(output_file, arr, geo_data, nodata, output_type=gdal.GDT_Int16):
+    np.nan_to_num(arr, nan=nodata)
+    driver = gdal.GetDriverByName('GTiff')
+    driver.Register()
+    h, w = np.shape(arr)
+    oDS = driver.Create(output_file, w, h, 1, output_type, ['COMPRESS=LZW', 'BIGTIFF=YES'])
+    out_band1 = oDS.GetRasterBand(1)
+    for i in range(h):
+        out_band1.WriteArray(arr[i].reshape(1, -1), 0, i)
+    oDS.SetProjection(geo_data.projection)
+    oDS.SetGeoTransform(geo_data.transform)
+    out_band1.FlushCache()
+    out_band1.SetNoDataValue(nodata)
+
+def create_path(path):
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+
+class CNN(nn.Module):
+    def __init__(self, feature_size):
+        super(CNN, self).__init__()
+        self.feature_size = feature_size
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=2, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(in_channels=2, out_channels=4, kernel_size=3, padding=1)
+        self.conv3 = nn.Conv1d(in_channels=4, out_channels=8, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv1d(in_channels=8, out_channels=16, kernel_size=3, padding=1)
+        self.conv5 = nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1)
+        self.conv6 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3, padding=1)
+        self.conv7 = nn.Conv1d(in_channels=64, out_channels=32, kernel_size=3, padding=1)
+        self.conv8 = nn.Conv1d(in_channels=32, out_channels=16, kernel_size=3, padding=1)
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool1d(kernel_size=3, stride=1)
+        self.fc = nn.Linear(in_features=16, out_features=1)
+
+    def forward(self, x):
+        x = x.view(-1, 1, self.feature_size)
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        x = self.conv3(x)
+        x = self.relu(x)
+        x = self.conv4(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        x = self.conv5(x)
+        x = self.relu(x)
+        x = self.conv6(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        x = self.conv7(x)
+        x = self.relu(x)
+        x = self.conv8(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        return self.fc(x.squeeze()).squeeze()
+
+class CNNLSTM(nn.Module):
+    hidden_size = 128  # 设置隐藏层
+    num_layers = 2  # 设置LSTM层数
+
+    def __init__(self, in_channels):
+        super(CNNLSTM, self).__init__()
+        self.in_channels = in_channels
+
+        # CNN Layers
+        self.conv1 = nn.Conv1d(in_channels=in_channels, out_channels=128, kernel_size=3, stride=1, padding=1)
+        self.bn1 = nn.BatchNorm1d(128)  # 添加BatchNorm1d层
+        self.relu = nn.ReLU()
+
+        # LSTM Layer
+        self.lstm = nn.LSTM(input_size=128, hidden_size=self.hidden_size, num_layers=self.num_layers, batch_first=True)
+
+        # Fully Connected Layer
+        self.fc = nn.Linear(self.hidden_size, 1)
+
+    def forward(self, x):
+        # CNN Forward
+        x = x.view(-1, self.in_channels, 1)
+        x = self.conv1(x)
+        x = self.bn1(x)  # 在激活函数前添加BatchNorm
+        x = self.relu(x)
+        x = x.permute(0, 2, 1)
+
+        # LSTM Forward
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.relu(lstm_out)
+
+        # Fully Connected Layer
+        fc_out = self.fc(lstm_out[:, -1, :])
+
+        return fc_out.squeeze()
+
+cnn_out_channels = 128
+lstm_hidden_size = 128
+lstm_num_layers = 2
+class CNNLSTMAttention(nn.Module):
+    def __init__(self, feature_size, time_size):
+        super(CNNLSTMAttention, self).__init__()
+        self.feature_size = feature_size
+        self.time_size = time_size
+
+        self.conv1 = nn.Conv1d(in_channels=feature_size, out_channels=cnn_out_channels, kernel_size=3, stride=1, padding=1)
+
+        self.bn1 = nn.BatchNorm1d(cnn_out_channels)  # 添加BatchNorm1d层
+        self.relu = nn.ReLU()
+
+        self.lstm = nn.LSTM(input_size=cnn_out_channels, hidden_size=lstm_hidden_size, num_layers=lstm_num_layers, batch_first=True)
+        self.attn = nn.Linear(lstm_hidden_size+cnn_out_channels, time_size)
+
+        self.fc = nn.Linear(lstm_hidden_size, 1)
+
+    def forward(self, x):
+        x = x.view(-1, self.feature_size, self.time_size)
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = x.permute(0, 2, 1)
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.relu(lstm_out)
+        attn_weights = torch.tanh(self.attn(torch.cat((lstm_out, x), 2)))
+        attn_weights = torch.softmax(attn_weights, dim=1)
+        attn_applied = torch.bmm(attn_weights.transpose(1, 2), lstm_out)
+        fc_out = self.fc(attn_applied[:, -1, :])
+        return fc_out.squeeze()
+
+class FC(nn.Module):
+    def __init__(self, in_features):
+        super(FC, self).__init__()
+        self.input = torch.nn.Linear(in_features, 16)
+        self.relu = nn.ReLU()
+        self.hidden = torch.nn.Linear(16, 32)
+        self.output = torch.nn.Linear(32, 1)
+
+    def forward(self, x):
+        x = self.input(x)
+        x = self.relu(x)
+        x = self.hidden(x)
+        x = self.relu(x)
+        return self.output(x).squeeze()
+
+
+def build_modeling_arr_from_df(modeling_df, modeling_x_list, modeling_y, std=False, x_scaler_list=None, y_scaler=None):
+    x_arr_list = [modeling_df[modeling_x].values for modeling_x in modeling_x_list]
+    y_arr = None
+    if modeling_y is not None:
+        y_arr = modeling_df[modeling_y].values
+    if std:
+        modeling_x_arr, modeling_y_arr, x_scaler_list, y_scaler = build_modeling_arr_with_std(x_arr_list, y_arr, x_scaler_list, y_scaler)
+    else:
+        modeling_x_arr = np.stack(x_arr_list, -1)
+        modeling_y_arr = y_arr
+    return modeling_x_arr, modeling_y_arr, y_arr, x_scaler_list, y_scaler
+
+class View(object):
+    def __init__(self, view_name=None, satellite_name=None, lst_product=None, lst_8day_product=None,
+                 lst_layer=None, qc_layer=None, view_time_layer=None, view_angle_layer=None):
+        self.view_name = view_name
+        self.satellite_name = satellite_name
+
+        self.lst_product = lst_product
+        self.lst_8day_product = lst_8day_product
+
+        self.lst_layer = lst_layer
+        self.qc_layer = qc_layer
+        self.view_time_layer = view_time_layer
+        self.view_angle_layer = view_angle_layer
+
+class LayerEnum(Enum):
+    # LST
+    LST_DAY = 0
+    LST_QC_DAY = 1
+    LST_DAY_VIEW_TIME = 2
+    LST_DAY_VIEW_ANGLE = 3
+    LST_NIGHT = 4
+    LST_QC_NIGHT = 5
+    LST_NIGHT_VIEW_TIME = 6
+    LST_NIGHT_VIEW_ANGLE = 7
+
+    # Vegetation Index
+    NDVI = 0
+    EVI = 1
+
+class ViewEnum(Enum):
+    TD = View(view_name="TD",
+              satellite_name="TERRA",
+              lst_product="MOD11A1",
+              lst_8day_product="MOD11A2",
+              lst_layer=LayerEnum.LST_DAY.value,
+              qc_layer=LayerEnum.LST_QC_DAY.value,
+              view_time_layer=LayerEnum.LST_DAY_VIEW_TIME.value,
+              view_angle_layer=LayerEnum.LST_DAY_VIEW_ANGLE.value)
+    TN = View(view_name="TN",
+              satellite_name="TERRA",
+              lst_product="MOD11A1",
+              lst_8day_product="MOD11A2",
+              lst_layer=LayerEnum.LST_NIGHT.value,
+              qc_layer=LayerEnum.LST_QC_NIGHT.value,
+              view_time_layer=LayerEnum.LST_NIGHT_VIEW_TIME.value,
+              view_angle_layer=LayerEnum.LST_NIGHT_VIEW_ANGLE.value)
+    AD = View(view_name="AD",
+              satellite_name="AQUA",
+              lst_product="MYD11A1",
+              lst_8day_product="MYD11A2",
+              lst_layer=LayerEnum.LST_DAY.value,
+              qc_layer=LayerEnum.LST_QC_DAY.value,
+              view_time_layer=LayerEnum.LST_DAY_VIEW_TIME.value,
+              view_angle_layer=LayerEnum.LST_DAY_VIEW_ANGLE.value)
+    AN = View(view_name="AN",
+              satellite_name="AQUA",
+              lst_product="MYD11A1",
+              lst_8day_product="MYD11A2",
+              lst_layer=LayerEnum.LST_NIGHT.value,
+              qc_layer=LayerEnum.LST_QC_NIGHT.value,
+              view_time_layer=LayerEnum.LST_NIGHT_VIEW_TIME.value,
+              view_angle_layer=LayerEnum.LST_NIGHT_VIEW_ANGLE.value)
+
+class NodataEnum(Enum):
+    MODIS_LST = 0
+    LST = 255
+    VIEW_TIME = 255
+    VIEW_ANGLE = 255
+    VEGETATION_INDEX = -3000
+    TEMPERATURE = 32767
+
+    GVE_DEM = 9998
+    GVE_WATER = -9999
+    GMTED_DEM = -32768
+    DEM = 32767
+    LATITUDE_LONGITUDE = 32767
+    MASK = 0
+    STATION = 0
+    XY_INDEX = 1200
+    CLIMATE = 0
+
+    DATE = 0
+
+    COVERAGE = 0
+
+class ModelEnum(Enum):
+    LINEAR = "Linear"
+    POLYNOMIAL = "Poly"
+    LASSO = "Lasso"
+    RANDOM_FOREST = "RF"
+    SUPPORT_VECTOR_MACHINE = "SVM"
+    GRADIENT_BOOSTING_DECISION_TREE = "GBDT"
+    EXTREME_GRADIENT_BOOSTING = "XGB"
+    FC = "FC"
+    CNN = "CNN"
+    CNN_LSTM = "CNNLSTM"
+    CNN_LSTM_ATTENTION = "CNNLSTMAttention"
+
+class ValidateModeEnum(Enum):
+    RANDOM = "random"
+    TILE = "tile"
+    TIME = "time"
+    FILE_ALL = "file_all"
+    FILE_GQ = "file_gq"
+    FILE_OQ = "file_oq"
+    SPECIFIC_FILE = "specific_file"
+    SIMULATE = "simulate"
+    NONE = "none"
+
+    FILE_RANDOM = 'file_random'
+
+    INTERPOLATE = "interpolate"
+    INTERPOLATE_REFER = "interpolate_refer"
+    INTERPOLATE_OTHER = "interpolate_other"
+    OVERALL = "overall"
+
+class QcMode(object):
+    name: str = ""
+    field: str = ""
+
+    def __init__(self, name="", field=""):
+        self.name = name
+        self.field = field
+
+class QcModeEnum(Enum):
+    GOOD_QUALITY = QcMode("goodquality", "GQ")
+    OTHER_QUALITY = QcMode("orderquality", "OQ")
+    ALL = QcMode("all", "ALL")
+
+class ColumnsEnum(Enum):
+    STATION_GSOD = ["STATION", "LATITUDE", "LONGITUDE", "ELEVATION", "NAME"]
+    STATION_GSOD_TYPE = {"STATION": str, "LATITUDE": float, "LONGITUDE": float, "ELEVATION": float, "NAME": str}
+
+    STATION = ["STATION", "LATITUDE", "LONGITUDE", "ELEVATION", "NAME", "SIN_X", "SIN_Y"]
+    STATION_TYPE = {"STATION": str, "LATITUDE": float, "LONGITUDE": float, "ELEVATION": float, "NAME": str,
+                    "SIN_X": float, "SIN_Y": float}
+
+    STATION_TILE = ["TILE", "STATION", "LATITUDE", "LONGITUDE", "ELEVATION", "NAME", "SIN_X", "SIN_Y", "INDEX_X", "INDEX_Y"]
+    STATION_TILE_TYPE = {"TILE": str, "STATION": str, "LATITUDE": float, "LONGITUDE": float, "ELEVATION": float,
+                         "NAME": str, "SIN_X": float, "SIN_Y": float, "INDEX_X": int, "INDEX_Y": int}
+
+    METE_GSOD = ["STATION", "DATE", "LATITUDE", "LONGITUDE", "ELEVATION", "TEMP", "TEMP_ATTRIBUTES"]
+    METE_GSOD_TYPE = {"STATION": str, "DATE": str, "LATITUDE": float, "LONGITUDE": float, "ELEVATION": float,
+                      "TEMP": float, "TEMP_ATTRIBUTES": int}
+
+    METE_STATION = ["STATION", "DATE", "LATITUDE", "LONGITUDE", "ELEVATION", "TEMP", "TEMP_ATTRIBUTES"]
+    METE_STATION_TYPE = {"STATION": str, "DATE": int, "LATITUDE": float, "LONGITUDE": float, "ELEVATION": float,
+                      "TEMP": float, "TEMP_ATTRIBUTES": int}
+
+    MODELING_DATA = ["STATION", "LATITUDE", "LONGITUDE", "ELEVATION", "DATE", "TEMP", "TEMP_ATTRIBUTES", "TD_ALL",
+                     "TN_ALL", "AD_ALL", "AN_ALL", "TD_ANGLE", "TN_ANGLE", "AD_ANGLE", "AN_ANGLE", "YEAR", "MONTH",
+                     "DOY"]
+    MODELING_DATA_TYPE = {"TILE": str, "STATION": str, "LATITUDE": "Int16", "LONGITUDE": "Int16", "ELEVATION": "Int16",
+                          "DATE": "Int32", "TEMP": "Int16", "TEMP_ATTRIBUTES": "Int16", "TD_ALL": "Int16",
+                          "TN_ALL": "Int16", "AD_ALL": "Int16", "AN_ALL": "Int16", "TD_ANGLE": "Int16",
+                          "TN_ANGLE": "Int16", "AD_ANGLE": "Int16", "AN_ANGLE": "Int16", "YEAR": "Int16",
+                          "MONTH": "Int16", "DOY": "Int16"}
+
+    SINGLE_STATION_TYPE = {"STATION": str}
+
+    SINGLE_METE = ["STATION", "DATE"]
+    SINGLE_METE_TYPE = {"STATION": str, "DATE": int}
+
+class Accuracy(object):
+    def __init__(self, size=0, r2=0, rmse=0, mae=0, bias=0):
+        self.size = size
+        self.r2 = r2
+        self.rmse = rmse
+        self.mae = mae
+        self.bias = bias
+
+    def __str__(self):
+        return f"size:{self.size} r2:{self.r2} rmse:{self.rmse} mae:{self.mae} bias:{self.bias}"
+
+    @staticmethod
+    def validate(true_arr, pred_arr, scaler_factor=1, filter_nodata=False, true_nodata=NodataEnum.TEMPERATURE.value, pred_nodata=NodataEnum.TEMPERATURE.value, format_str=".4g"):
+        if filter_nodata:
+            condition = (true_arr != true_nodata) & (pred_arr != pred_nodata)
+            true_arr = true_arr[condition]
+            pred_arr = pred_arr[condition]
+        true_arr = true_arr.astype(np.float32)     #真实值数组和预测值数组转换为np.float32类型，以便后续的计算
+        pred_arr = pred_arr.astype(np.float32)
+        true_arr *= scaler_factor
+        pred_arr *= scaler_factor
+        accuracy = Accuracy()
+        accuracy.size = true_arr.size
+        if accuracy.size != 0:
+            accuracy.r2 = format(r2_score(true_arr, pred_arr), format_str)
+            accuracy.rmse = format(root_mean_squared_error(true_arr, pred_arr), format_str)
+            accuracy.mae = format(mean_absolute_error(true_arr, pred_arr), format_str)
+            # precision.mare = np.mean(np.abs((true_arr - pred_arr) / true_arr))
+            accuracy.bias = format(np.mean(pred_arr - true_arr), format_str)
+        return accuracy
+
+class ModelEnum(Enum):
+    LINEAR = "Linear"
+    POLYNOMIAL = "Poly"
+    LASSO = "Lasso"
+    RANDOM_FOREST = "RF"
+    SUPPORT_VECTOR_MACHINE = "SVM"
+    GRADIENT_BOOSTING_DECISION_TREE = "GBDT"
+    EXTREME_GRADIENT_BOOSTING = "XGB"
+    FC = "FC"
+    CNN = "CNN"
+    CNN_LSTM = "CNNLSTM"
+    CNN_LSTM_ATTENTION = "CNNLSTMAttention"
+
+
+class Configuration(object):
+    tile_list: list = []
+    year_list: list = []
+    date_list: list = []
+    validate_mode: str = ""
+    validate_test_ratio: int = 0
+    test_ratio: int = 0
+    train_tile_list: list = []
+    validate_tile_list: list = []
+    test_tile_list: list = []
+    train_year_list: list = []
+    validate_year_list: list = []
+    test_year_list: list = []
+    specific_validate_file: str = ""
+    specific_test_file: str = ""
+
+    view_list: list = []
+    qc_mode: QcMode = None
+    auxiliary_list: list = []
+    modeling_x_list: list = []
+    modeling_y: str = ""
+    modeling_attribute_list = []
+
+    model: str = ""
+    time_size: int = 1
+    std: bool = True
+
+    #path: Path = None
+
+def transform(arr, scaler=None):
+    if scaler is None:
+        scaler = StandardScaler()
+        arr = scaler.fit_transform(arr.reshape(-1, 1)).flatten()
+        return arr, scaler
+    else:
+        return scaler.transform(arr.reshape(-1, 1)).flatten()
+
+def inverse_transform(arr, scaler):
+    return scaler.inverse_transform(arr.reshape(-1, 1)).flatten()
+
+
+def build_modeling_arr_with_std(x_arr_list, y_arr, x_scaler_list=None, y_scaler=None):
+    if x_scaler_list is not None:
+        x_std_arr_list = [transform(x_arr, x_scaler_list[index]) for index, x_arr in enumerate(x_arr_list)]
+    else:
+        x_std_arr_list = []
+        x_scaler_list = []
+        for x_arr in x_arr_list:
+            x_std_arr, x_scaler = transform(x_arr)
+            x_std_arr_list.append(x_std_arr)
+            x_scaler_list.append(x_scaler)
+    modeling_x_arr = np.stack(x_std_arr_list, -1)
+    modeling_y_arr = None
+    if y_arr is not None:
+        if y_scaler is not None:
+            modeling_y_arr = transform(y_arr, y_scaler)
+        else:
+            modeling_y_arr, y_scaler = transform(y_arr)
+    return modeling_x_arr, modeling_y_arr, x_scaler_list, y_scaler
+
+
+class BaseDataset(object):
+    nodata_dict = {"GQ": NodataEnum.TEMPERATURE.value, "ALL": NodataEnum.TEMPERATURE.value,
+                   "ANGLE": NodataEnum.VIEW_ANGLE.value,
+                   "TA": NodataEnum.TEMPERATURE.value, "REFER": NodataEnum.TEMPERATURE.value,
+                   "EVI": NodataEnum.VEGETATION_INDEX.value, "NDVI": NodataEnum.VEGETATION_INDEX.value,
+                   "LATITUDE": NodataEnum.LATITUDE_LONGITUDE.value, "LONGITUDE": NodataEnum.LATITUDE_LONGITUDE.value,
+                   "ELEVATION": NodataEnum.DEM.value,
+                   "MONTH": NodataEnum.DATE.value, "DOY": NodataEnum.DATE.value}
+
+    def __init__(self):
+        self.mask_arr = None
+
+        self.evi_arr = None
+        self.ndvi_arr = None
+        self.latitude_arr = None
+        self.longitude_arr = None
+        self.elevation_arr = None
+
+        self.ta_arr = None
+
+    def build_modeling_arr_from_arr(self, modeling_x_list, modeling_y, modeling=True, std=False, x_scaler_list=None, y_scaler=None):
+        modeling_x_arr = None
+        modeling_y_arr = None
+        y_arr = getattr(self, f"{modeling_y.lower()}_arr")
+        if modeling:
+            # condition = (y_arr != self.nodata_dict[modeling_y.split("_")[-1]]) & (self.mask_arr != NodataEnum.MASK.value)
+            condition = (y_arr != self.nodata_dict[modeling_y.split("_")[-1]])
+        else:
+            # condition = (y_arr == self.nodata_dict[modeling_y.split("_")[-1]]) & (self.mask_arr != NodataEnum.MASK.value)
+            condition = (y_arr == self.nodata_dict[modeling_y.split("_")[-1]])
+        x_arr_list = []
+        for modeling_x in modeling_x_list:
+            x_arr = getattr(self, f"{modeling_x.lower()}_arr")
+            if x_arr is None:
+                x_arr_list.clear()
+                break
+            x_arr_list.append(x_arr)
+            condition &= (x_arr != self.nodata_dict[modeling_x.split("_")[-1]])
+        y_1d_arr = y_arr[condition]
+        if x_arr_list and y_1d_arr.size > 0:
+            modeling_x_arr_list = [x_arr[condition] for x_arr in x_arr_list]
+            if modeling:
+                modeling_y_arr = y_1d_arr
+            if std:
+                modeling_x_arr, modeling_y_arr, x_scaler_list, y_scaler = build_modeling_arr_with_std(modeling_x_arr_list, modeling_y_arr, x_scaler_list, y_scaler)
+            else:
+                modeling_x_arr = np.stack(modeling_x_arr_list, -1)
+        return modeling_x_arr, modeling_y_arr, condition, x_scaler_list, y_scaler
+
+class Dataset(BaseDataset):
+    all_view_list = convert_enum_to_value(ViewEnum)
+    all_auxiliary_list = ["EVI", "ANGLE", "LATITUDE", "LONGITUDE", "ELEVATION", "MONTH", "DOY"]
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.td_all_arr = None
+        self.tn_all_arr = None
+        self.ad_all_arr = None
+        self.an_all_arr = None
+        self.td_gq_arr = None
+        self.tn_gq_arr = None
+        self.ad_gq_arr = None
+        self.an_gq_arr = None
+        self.td_angle_arr = None
+        self.tn_angle_arr = None
+        self.ad_angle_arr = None
+        self.an_angle_arr = None
+        self.month_arr = None
+        self.doy_arr = None
+
+        self.modeling_df: pd.DataFrame() = None
+        self.validate_df: pd.DataFrame() = None
+        self.test_df: pd.DataFrame() = None
+        self.OR_train_df: pd.DataFrame() = None
+
+
+    def __read_modeling_csv(self):
+        config = self.config
+        modeling_file = os.path.join(estimate_modeling_data_path, f"modeling_{config.modeling_attribute_list[0]}_{config.modeling_attribute_list[-1]}.csv")  # 这个是什么数据？？
+        if not os.path.isfile(modeling_file):
+            modeling_df_list = []
+            for tile in config.tile_list:
+                modeling_tile_file = os.path.join(estimate_modeling_data_path, f"modeling_{tile}.csv")  # 从value_extract中输出的这个数据
+                if os.path.exists(modeling_tile_file):
+                    print(modeling_tile_file)
+                    modeling_df = pd.read_csv(modeling_tile_file, dtype=ColumnsEnum.MODELING_DATA_TYPE.value)
+                    modeling_df = modeling_df[(modeling_df["YEAR"].isin(config.year_list)) & (modeling_df["TEMP_ATTRIBUTES"].isin(config.modeling_attribute_list))]
+                    if modeling_df.shape[0] > 0:      # shape[0] 是行数，这是指modeling_df的行数如果大于0就执行下面的程序
+                        modeling_df_list.append(modeling_df)
+            modeling_df = pd.concat(modeling_df_list)
+            to_csv(modeling_df, modeling_file, False)
+        else:
+            modeling_df = pd.read_csv(modeling_file, dtype=ColumnsEnum.MODELING_DATA_TYPE.value)
+            modeling_df = modeling_df[modeling_df["YEAR"].isin(config.year_list)]
+        return modeling_df
+
+    def load_modeling_data(self, load_modeling_data=True, load_validate_data=True):
+        config = self.config
+        modeling_df = self.modeling_df
+        #path = config.path
+        if load_modeling_data:
+            self.modeling_df = self.__read_modeling_csv()     #读入的是modeling_df
+            print(f"load modeling data:{self.modeling_df.shape}")
+        if load_validate_data:
+            if config.validate_mode in [ValidateModeEnum.FILE_ALL.value, ValidateModeEnum.FILE_GQ.value, ValidateModeEnum.FILE_OQ.value]:
+                validate_csv = os.path.join(estimate_validate_data_path, f"validate_{config.modeling_attribute_list[0]}_{config.modeling_attribute_list[-1]}.csv")
+                test_csv = os.path.join(estimate_validate_data_path, f"test_{config.modeling_attribute_list[0]}_{config.modeling_attribute_list[-1]}.csv")
+                if not os.path.isfile(validate_csv) or not os.path.isfile(test_csv):
+                    modeling_all_df = handle_null(modeling_df, build_modeling_x_list(self.all_view_list, QcModeEnum.ALL.value, self.all_auxiliary_list))
+                    modeling_gq_df = handle_null(modeling_df, build_modeling_x_list(self.all_view_list, QcModeEnum.GOOD_QUALITY.value, self.all_auxiliary_list))
+                    modeling_oq_df = handle_null(modeling_all_df, build_modeling_x_list(self.all_view_list, QcModeEnum.GOOD_QUALITY.value, []), True)
+                    modeling_mixed_df = pd.concat([modeling_all_df, modeling_gq_df, modeling_oq_df]).drop_duplicates(ColumnsEnum.SINGLE_METE.value, keep=False)
+                    validate_test_gq_df = train_test_split(modeling_gq_df, test_size=config.validate_test_ratio, random_state=0)[1]
+                    validate_gq_df, test_gq_df = train_test_split(validate_test_gq_df, test_size=config.test_ratio/config.validate_test_ratio, random_state=0)
+                    validate_test_oq_df = train_test_split(modeling_oq_df, test_size=config.validate_test_ratio, random_state=0)[1]
+                    validate_oq_df, test_oq_df = train_test_split(validate_test_oq_df, test_size=config.test_ratio/config.validate_test_ratio, random_state=0)
+                    validate_test_mixed_df = train_test_split(modeling_mixed_df, test_size=config.validate_test_ratio, random_state=0)[1]
+                    validate_mixed_df, test_mixed_df = train_test_split(validate_test_mixed_df, test_size=config.test_ratio/config.validate_test_ratio, random_state=0)
+                    validate_all_df = self.validate_df = pd.concat([validate_gq_df, validate_oq_df, validate_mixed_df], ignore_index=True)
+                    test_all_df = self.test_df = pd.concat([test_gq_df, test_oq_df, test_mixed_df], ignore_index=True)
+                    to_csv(validate_all_df, validate_csv, False)
+                    to_csv(test_all_df, test_csv, False)
+                else:
+                    self.validate_df = pd.read_csv(validate_csv, dtype=ColumnsEnum.MODELING_DATA_TYPE.value)
+                    self.test_df = pd.read_csv(test_csv, dtype=ColumnsEnum.MODELING_DATA_TYPE.value)
+            elif config.validate_mode == ValidateModeEnum.SPECIFIC_FILE.value:
+                self.validate_df = pd.read_csv(config.specific_validate_file, dtype=ColumnsEnum.MODELING_DATA_TYPE.value)
+                self.test_df = pd.read_csv(config.specific_test_file, dtype=ColumnsEnum.MODELING_DATA_TYPE.value)
+            elif config.validate_mode == ValidateModeEnum.FILE_RANDOM.value:
+                OR_validate_csv = os.path.join(estimate_validate_data_path, f"OR_validate_{config.modeling_attribute_list[0]}_{config.modeling_attribute_list[-1]}.csv")
+                OR_train_csv = os.path.join(estimate_validate_data_path, f" OR_train_{config.modeling_attribute_list[0]}_{config.modeling_attribute_list[-1]}.csv")
+                if os.path.isfile(OR_train_csv) and os.path.isfile(OR_validate_csv):
+                    self.validate_df = pd.read_csv(OR_validate_csv)
+                    self.OR_train_df = pd.read_csv(OR_train_csv)
+                else:
+                    sampled_df = modeling_df.sample(frac=0.2, random_state=42)  # 从modeling_df 中随机抽取 20% 的数据
+                    remaining_df = modeling_df.drop(sampled_df.index)# 剩余的 80% 数据
+                    to_csv(remaining_df, OR_train_csv, False)
+                    to_csv(sampled_df, OR_validate_csv, False)
+                    self.validate_df = sampled_df
+                    self.OR_train_df = remaining_df
+                self.test_df = pd.DataFrame()
+            else:
+                self.validate_df = pd.DataFrame()
+                self.test_df = pd.DataFrame()
+            print(f"load validate data:{self.validate_df.shape}")
+            print(f"load test data:{self.test_df.shape}")
+        return self
+
+
+def get_date_interval(start_date, end_date):
+    start_date = int(start_date)
+    end_date = int(end_date)
+    return (date(end_date // 1000, 1, 1) + timedelta(end_date % 1000) - date(start_date // 1000, 1, 1) - timedelta(start_date % 1000)).days
+
+
+class BaseExecutor(object):
+    all_view_list = convert_enum_to_value(ViewEnum)
+    all_auxiliary_list = ["EVI", "ANGLE", "LATITUDE", "LONGITUDE", "ELEVATION", "MONTH", "DOY"]
+
+    def __init__(self, config, model, dataset, time_series):
+        self.config: Configuration = config
+        self.model = model
+        self.dataset: Dataset = dataset
+        self.time_series = time_series
+
+        self.x_scaler_list = None
+        self.y_scaler = None
+
+        self.train_x_arr, self.train_y_arr, self.original_train_y_arr = None, None, None
+        self.validate_x_arr, self.validate_y_arr = None, None
+        self.test_x_arr, self.test_y_arr = None, None
+        self.pred_x_arr, self.pred_y_arr = None, None
+
+        self.train_precision: Accuracy = Accuracy()
+        self.validate_precision: Accuracy = Accuracy()
+        self.test_precision: Accuracy = Accuracy()
+
+        self.importance_list = None
+
+        self.lock = None
+
+    # 时间序列相关均为测试代码，未完善，未实际使用
+    def __convert_to_time_series(self, modeling_df, dataset_name, time_size):
+        #time_size_file = os.path.join(self.config.path.estimate_modeling_data_path, f"{dataset_name}_modeling_t{time_size}.csv")
+        time_size_file = os.path.join(estimate_modeling_data_path, f"{dataset_name}_modeling_t{time_size}.csv")
+        if os.path.isfile(time_size_file):
+            modeling_df = pd.read_csv(time_size_file)
+        else:
+            modeling_df = modeling_df.sort_values("DATE")
+            station_df_list = []
+            for station, station_df in modeling_df.groupby("STATION"):
+                station_df.sort_values("DATE")
+                for index in range(time_size - 1, station_df.shape[0]):
+                    prev_index = index - time_size + 1
+                    if get_date_interval(station_df.iloc[prev_index]["DATE"], station_df.iloc[index]["DATE"]) == time_size - 1:
+                        station_df_list.append(station_df.iloc[prev_index:index + 1])
+            modeling_df = pd.concat(station_df_list)
+            to_csv(modeling_df, time_size_file, False)
+        return modeling_df
+
+    def __build_modeling_arr(self, modeling_df, modeling_x_list=None):
+        if modeling_df.size == 0:
+            return np.array([]), np.array([]), np.array([])
+        if modeling_x_list is None:
+            modeling_x_list = self.config.modeling_x_list
+        modeling_y = self.config.modeling_y
+        for modeling_x in modeling_x_list:
+            modeling_df = modeling_df[modeling_df[modeling_x].notnull()]
+        time_size = self.config.time_size
+        if time_size != 1:
+            modeling_df = self.__convert_to_time_series(modeling_df, "", time_size)
+        x_arr, y_arr, original_y_arr, self.x_scaler_list, self.y_scaler =\
+            build_modeling_arr_from_df(modeling_df, modeling_x_list, modeling_y, self.config.std, self.x_scaler_list, self.y_scaler)
+        if time_size != 1:
+            x_arr = x_arr.reshape(-1, time_size, len(modeling_x_list))
+            if not self.time_series:
+                x_arr = x_arr[:, time_size-1, :]
+            y_arr = y_arr.reshape(-1, time_size)[:, time_size-1]
+            original_y_arr = original_y_arr.reshape(-1, time_size)[:, time_size-1]
+        return x_arr, y_arr, original_y_arr
+
+    # 保留了适应深度学习的train-validate-test数据集划分部分代码，但目前仅使用train-validate数据集划分
+    def _build_modeling_dataset(self, use_serialized_model: bool, serialize: bool):
+        config = self.config
+        dataset = self.dataset
+        modeling_df = dataset.modeling_df
+       # path = config.path
+        validate_mode = config.validate_mode
+        serialized_xscaler_file = os.path.join(base_model_path, f"xscaler_{''.join(view.view_name for view in config.view_list)}_{config.qc_mode.field}.pkl")
+        serialized_yscaler_file = os.path.join(base_model_path, f"yscaler_{''.join(view.view_name for view in config.view_list)}_{config.qc_mode.field}.pkl")
+        if use_serialized_model and config.std and os.path.isfile(serialized_xscaler_file) and os.path.isfile(serialized_yscaler_file):
+            with open(serialized_xscaler_file, "rb") as file:
+                self.x_scaler_list = pickle.load(file)
+            with open(serialized_yscaler_file, "rb") as file:
+                self.y_scaler = pickle.load(file)
+        validate_x_list = config.modeling_x_list
+        if validate_mode == ValidateModeEnum.RANDOM.value:
+            train_df, validate_test_df = train_test_split(modeling_df, test_size=config.validate_test_ratio, random_state=0)    # train_test_split用于随机划分数据集，test_size验证和测试集占整个数据集的比例
+            validate_df, test_df = train_test_split(validate_test_df, test_size=config.test_ratio/config.validate_test_ratio, random_state=0)
+        elif validate_mode == ValidateModeEnum.TILE.value:
+            train_df = modeling_df[modeling_df["TILE"].isin(config.train_tile_list)]        # 从 modeling_df 中选取 TILE 列的值在 config.train_tile_list 中的数据作为训练集（train_df）
+            validate_df = modeling_df[modeling_df["TILE"].isin(config.validate_tile_list)]
+            test_df = modeling_df[modeling_df["TILE"].isin(config.test_tile_list)]
+        elif validate_mode == ValidateModeEnum.TIME.value:
+            train_df = modeling_df[modeling_df["YEAR"].isin(config.train_year_list)]
+            validate_df = modeling_df[modeling_df["YEAR"].isin(config.validate_year_list)]
+            test_df = modeling_df[modeling_df["YEAR"].isin(config.test_year_list)]
+        elif validate_mode in [ValidateModeEnum.FILE_ALL.value, ValidateModeEnum.FILE_GQ.value, ValidateModeEnum.FILE_OQ.value]:
+            train_df = pd.concat([modeling_df, dataset.validate_df]).drop_duplicates(ColumnsEnum.SINGLE_METE.value, keep=False) # 将 modeling_df 和 dataset.validate_df 进行垂直合并，并进行去重
+            if validate_mode == ValidateModeEnum.FILE_ALL.value:
+                validate_df = dataset.validate_df
+                test_df = dataset.test_df
+                validate_x_list = build_modeling_x_list(config.view_list, QcModeEnum.ALL.value, config.auxiliary_list)
+            elif validate_mode == ValidateModeEnum.FILE_GQ.value:
+                validate_df = handle_null(dataset.validate_df, build_modeling_x_list(self.all_view_list, QcModeEnum.GOOD_QUALITY.value, self.all_auxiliary_list))
+                test_df = handle_null(dataset.test_df, build_modeling_x_list(self.all_view_list, QcModeEnum.GOOD_QUALITY.value, self.all_auxiliary_list))
+                validate_x_list = build_modeling_x_list(config.view_list, QcModeEnum.GOOD_QUALITY.value, config.auxiliary_list)
+            else:
+                validate_df = handle_null(dataset.validate_df, build_modeling_x_list(self.all_view_list, QcModeEnum.GOOD_QUALITY.value, []), True)
+                test_df = handle_null(dataset.test_df, build_modeling_x_list(self.all_view_list, QcModeEnum.ALL.value, []), True)
+                validate_x_list = build_modeling_x_list(config.view_list, QcModeEnum.ALL.value, config.auxiliary_list)
+        elif validate_mode == ValidateModeEnum.SPECIFIC_FILE.value:
+            train_df = modeling_df
+            validate_df = dataset.validate_df
+            test_df = dataset.test_df
+        elif config.validate_mode == ValidateModeEnum.FILE_RANDOM.value:
+            train_df = dataset.OR_train_df
+            validate_df = handle_null(dataset.validate_df, build_modeling_x_list(self.all_view_list, QcModeEnum.ALL.value, self.all_auxiliary_list))
+            test_df = pd.DataFrame([])
+        else:
+            train_df = modeling_df
+            validate_df = test_df = pd.DataFrame([])
+        self.train_x_arr, self.train_y_arr, self.original_train_y_arr = self.__build_modeling_arr(train_df)
+        self.validate_x_arr, _, self.validate_y_arr = self.__build_modeling_arr(validate_df, validate_x_list)
+        self.test_x_arr, _, self.test_y_arr = self.__build_modeling_arr(test_df, validate_x_list)
+        if serialize and config.std:
+            with open(serialized_xscaler_file, "wb") as file:
+                pickle.dump(self.x_scaler_list, file)
+            with open(serialized_yscaler_file, "wb") as file:
+                pickle.dump(self.y_scaler, file)
+        print(validate_mode, config.qc_mode.name, "".join(view.view_name for view in config.view_list), config.model)
+        print(f"train:{self.train_x_arr.shape}")
+        print(f"validate:{self.validate_x_arr.shape}")
+        print(f"test:{self.test_x_arr.shape}")
+
+    def _fit(self, use_serialized_model: bool, serialize: bool):
+        config = self.config
+        model = self.model
+        #serialized_file = os.path.join(config.path.model_path, f"{config.model}_{''.join(view.view_name for view in config.view_list)}_{config.qc_mode.field}.pkl")
+        serialized_file = os.path.join(base_model_path, f"{config.model}_{''.join(view.view_name for view in config.view_list)}_{config.qc_mode.field}.pkl")
+        if use_serialized_model and os.path.isfile(serialized_file):
+            with open(serialized_file, "rb") as file:              # 以二进制读模式 ("rb") 打开序列化文件
+                self.model = pickle.load(file)                     # 使用 pickle 从文件中加载模型对象，并赋值给 self.model
+        else:
+            if config.model == ModelEnum.EXTREME_GRADIENT_BOOSTING.value:
+                train_x_arr = cupy.array(self.train_x_arr)     # 训练数据（self.train_x_arr 和 self.train_y_arr）转换为 CuPy 数组，以便在 GPU 上进行计算
+                train_y_arr = cupy.array(self.train_y_arr)
+            else:
+                train_x_arr = np.array(self.train_x_arr)
+                train_y_arr = np.array(self.train_y_arr)
+            model.fit(train_x_arr, train_y_arr)            # 调用模型的 fit 方法，使用训练数据进行模型训练
+        if serialize:
+            with open(serialized_file, "wb") as file:      # 以二进制写模式 ("wb") 打开序列化文件
+                pickle.dump(model, file)                   # 使用 pickle 将模型对象序列化并保存到文件中
+
+    def build_model(self, use_serialized_model=False, serialize=False, build_dataset=True, record_to_csv=True):
+        if build_dataset:
+            self._build_modeling_dataset(use_serialized_model, serialize)
+        self._fit(use_serialized_model, serialize)
+        if record_to_csv:
+            config = self.config
+            train_precision = self.train_precision
+            validate_precision = self.validate_precision
+            test_precision = self.test_precision
+            record_dict = {"model": [config.model], "view_list": [''.join(view.view_name for view in config.view_list)],
+                           "qc_mode": [config.qc_mode.name], "auxiliary_list": [config.auxiliary_list],
+                           "modeling_y": [config.modeling_y], "modeling_attribute_list": [config.modeling_attribute_list],
+                           "validate_mode": [config.validate_mode], "std": [config.std],
+                           "train_count": [self.train_precision.size], "train_r2": [train_precision.r2], "train_rmse": [train_precision.rmse], "train_mae": [train_precision.mae], "train_bias": [train_precision.bias],
+                           "validate_count": [self.validate_precision.size], "validate_r2": [validate_precision.r2], "validate_rmse": [validate_precision.rmse], "validate_mae": [validate_precision.mae], "validate_bias": [validate_precision.bias]}
+            if self.test_x_arr.size != 0:
+                record_dict.update({"test_count": [self.test_precision.size], "test_r2": [test_precision.r2], "test_rmse": [test_precision.rmse], "test_mae": [test_precision.mae], "test_bias": [test_precision.bias]})
+            #to_csv(pd.DataFrame(record_dict), os.path.join(config.path.cloud_record_path, "modeling", f"{config.model}_accuracy.csv"), lock=self.lock)
+            to_csv(pd.DataFrame(record_dict), os.path.join(record_path, "modeling", f"{config.model}_accuracy.csv"), lock=self.lock)
+            """
+            importance_dict = {"model": [config.model], "view_list": [config.view_list], "qc_mode": [config.qc_mode], "auxiliary_list": config.auxiliary_list, "modeling_y": [config.modeling_y]}
+            for modeling_x in build_modeling_x_list(convert_enum_to_value(ViewEnum), config.qc_mode, config.auxiliary_list):
+                importance_dict[modeling_x] = 0
+            for index, modeling_x in enumerate(config.modeling_x_list):
+                importance_dict[modeling_x] = self.importance_list[index]
+            to_csv(pd.DataFrame(importance_dict), os.path.join(config.path.cloud_record_path, "modeling", f"{config.model}_importance.csv"), lock=self.lock)
+            """
+
+    def predict(self):
+        #pred_x_arr = cupy.array(self.pred_x_arr)
+        pred_x_arr = np.array(self.pred_x_arr)
+        pred_y_arr = self.model.predict(pred_x_arr)
+        self.pred_y_arr = inverse_transform(pred_y_arr, self.y_scaler) if self.config.std else pred_y_arr
+
+class GeneralExecutor(BaseExecutor):
+    def __init__(self, config, model, dataset):
+        super().__init__(config, model, dataset, False)
+
+    def _build_modeling_dataset(self, use_serialized_model: bool, serialize: bool):
+        super()._build_modeling_dataset(use_serialized_model, serialize)        # 调用 BaseExecutor 类中的 _build_modeling_dataset 方法，子类 GeneralExecutor 继承自 BaseExecutor 并重写了 _build_modeling_dataset 方法：
+        if self.test_x_arr.size != 0:
+            print(self.validate_y_arr.shape)
+            print(self.test_y_arr.shape)
+            self.validate_x_arr = np.concatenate([self.validate_x_arr, self.test_x_arr], )   # np.vstack 将 test_x_arr 和 test_y_arr 垂直堆叠到 validate_x_arr 和 validate_y_arr 上,将测试集的数据合并到验证集中
+            self.validate_y_arr = np.concatenate([self.validate_y_arr, self.test_y_arr])
+            self.test_x_arr = self.test_y_arr = np.array([])    #  清空 test_x_arr 和 test_y_arr
+            print(f"train:{self.train_x_arr.shape}")
+            print(f"validate:{self.validate_x_arr.shape}")
+
+    def _fit(self, use_serialized_model: bool, serialize: bool):
+        config = self.config
+        modeling_x_list = config.modeling_x_list
+        regressor = self.model
+        super()._fit(use_serialized_model, serialize)
+        if config.model == ModelEnum.LINEAR.value:       #构建线性回归模型公式
+            express = "TEMP="
+            for i in range(0, len(modeling_x_list)):
+                operator = "+" if i > 0 and regressor.coef_[i] > 0 else ""       # 如果不是第一个特征且当前系数为正，则操作符为加号，否则为空字符串
+                express += f"{operator}{regressor.coef_[i]}*{modeling_x_list[i]}"   # 将当前特征的系数和名称加入公式中
+            operator = "+" if regressor.intercept_ > 0 else ""                    # 如果截距为正，则操作符为加号，否则为空字符串。
+            express += f"{operator}{regressor.intercept_}"                    #
+            print(express)
+        if config.model == ModelEnum.EXTREME_GRADIENT_BOOSTING.value:
+          train_x_arr = cupy.array(self.train_x_arr)
+          validate_x_arr = cupy.array(self.validate_x_arr)
+        else:
+         train_x_arr = np.array(self.train_x_arr)
+         validate_x_arr = np.array(self.validate_x_arr)
+        if config.std:
+            pred_y_with_train_arr = inverse_transform(regressor.predict(train_x_arr), self.y_scaler)  # 对训练数据进行预测，并使用 inverse_transform 函数将结果逆变换
+            pred_y_with_validate_arr = inverse_transform(regressor.predict(validate_x_arr), self.y_scaler)
+        else:
+            pred_y_with_train_arr = regressor.predict(train_x_arr)
+            pred_y_with_validate_arr = regressor.predict(validate_x_arr)
+        self.train_precision = Accuracy.validate(self.original_train_y_arr, pred_y_with_train_arr, 0.01)    # 计算训练集的预测精度
+        self.validate_precision = Accuracy.validate(self.validate_y_arr, pred_y_with_validate_arr, 0.01)
+        # to_csv(pd.DataFrame({config.modeling_y: self.validate_y_arr, f"PRED_{config.modeling_y}": pred_y_with_validate_arr}),
+        #        os.path.join(path.estimate_validate_data_path, f"{config.model}_{''.join(view.view_name for view in config.view_list)}_{config.qc_mode.field}_validate_result.csv"),
+        #        False)
+        print(f"train:{self.train_precision}")
+        print(f"validate:{self.validate_precision}")
+        # self.importance_list = [round(importance, 4) for importance in regressor.feature_importances_]
+        # print(self.importance_list)
+
+    def predict(self, estimate_ta=True):
+        config = self.config
+        dataset = self.dataset
+        if estimate_ta:
+            self.pred_x_arr, _, condition, _, _ = dataset.build_modeling_arr_from_arr(config.modeling_x_list, config.modeling_y, False, config.std, self.x_scaler_list)
+            size = 0
+            if self.pred_x_arr is not None:
+                super().predict()       # 调用父类的 predict 方法进行预测。
+                dataset.ta_arr[condition] = self.pred_y_arr   # 预测得到的结果存储到数据集的ta_arr数组中
+                size = self.pred_y_arr.size
+            return size
+        else:
+            super().predict()
+
+
+def get_world_tile( inland=None, vi=None, pixel_limit=0):
+    tile_df = pd.read_csv(os.path.join(modis_data_path, "land_tile_list.csv"))
+    if inland is not None:
+        if inland:
+            tile_df = tile_df[tile_df["inland"] == 1]
+        else:
+            tile_df = tile_df[tile_df["inland"] != 1]
+    if vi is not None:
+        if vi:
+            tile_df = tile_df[tile_df["vi"] == 1]
+        else:
+            tile_df = tile_df[tile_df["vi"] != 1]
+    tile_df = tile_df[tile_df["count"] >= pixel_limit]
+    return list(tile_df["tile"].values)
+
+
+estimate_modeling_data_path = r'E:\zx\All_data\estimate_modeling_data'
+
+estimate_validate_data_path = r'E:\zx\All_data\estimate_validate_data'
+
+estimate_ta_path = r'E:\zx\All_data\estimate_ta'
+
+base_model_path = r'E:\zx\All_data\model'
+
+record_path =r'E:\zx\All_data\record'  #?
+
+mask_path = r'E:\zx\All_data\mask'          # 在此文件夹下输入瓦片掩膜的tif图
+
+dem_path = r'E:\zx\All_data\dem'            # 在此文件中输入"dem_{tile}.tif"
+
+latitude_path = r'E:\zx\All_data\latitude'
+
+longitude_path = r'E:\zx\All_data\longitude'
+
+estimate_record_path = r'E:\zx\All_data\estimate_record'
+
+lst_path = r'E:\LST\lst'
+
+modis_data_path = r'E:\zx\All_data\modis_data'
+
+
+def get_model(model, feature_size=0, time_size=1):
+    regressor = None
+    if model == ModelEnum.CNN.value:
+        regressor = CNN(feature_size)      #模型类型是 CNN，则返回一个 CNN 回归器
+    elif model == ModelEnum.FC.value:
+        regressor = FC(feature_size)
+    elif model == ModelEnum.CNN_LSTM.value:
+        regressor = CNNLSTM(feature_size)
+    elif model == ModelEnum.CNN_LSTM_ATTENTION.value:
+        regressor = CNNLSTMAttention(feature_size, time_size)
+    elif model in [ModelEnum.LINEAR.value, ModelEnum.POLYNOMIAL.value]:
+        regressor = LinearRegression(n_jobs=40)
+    elif model == ModelEnum.LASSO.value:
+        regressor = Lasso()
+    elif model == ModelEnum.RANDOM_FOREST.value:
+        regressor = RandomForestRegressor(n_estimators=400, n_jobs=64, max_features=4, max_depth=40)
+    elif model == ModelEnum.SUPPORT_VECTOR_MACHINE.value:
+        regressor = SVR(C=10000)
+    elif model == ModelEnum.GRADIENT_BOOSTING_DECISION_TREE.value:
+        regressor = GradientBoostingRegressor(learning_rate=0.06, loss="squared_error", n_estimators=200,
+                                              max_features=3, subsample=0.6, max_depth=18)
+    elif model == ModelEnum.EXTREME_GRADIENT_BOOSTING.value:
+        regressor = XGBRegressor(n_estimators=400, learning_rate=0.1, gamma=0.005, reg_lambda=13, max_depth=22,
+                                 subsample=0.9, tree_method="hist", device="cuda")
+    return regressor
+
+
+def build_single_model(config: Configuration, dataset: Dataset, model_list, lock=None):
+    executor = GeneralExecutor(config, None, dataset)
+    for index, model in enumerate(model_list):
+        config.model = model
+        executor.model = get_model(model)   # 会返回一个regressor
+        executor.lock = lock
+        executor.build_model(False, False, index == 0, True)
+
+
+def build_model(config: Configuration, pool_size=1):
+    validate_mode_list = [ValidateModeEnum.FILE_RANDOM.value]
+    qc_mode_list = [QcModeEnum.ALL.value]
+    views_list = [[ViewEnum.TD.value, ViewEnum.TN.value, ViewEnum.AD.value, ViewEnum.AN.value], # TD+TN+AD+AN,TD+TN,AD+AN,TD,TN,AD,AN.
+                  [ViewEnum.TD.value, ViewEnum.TN.value],
+                  [ViewEnum.AD.value, ViewEnum.AN.value],
+                  [ViewEnum.TN.value],
+                  [ViewEnum.AN.value],
+                  [ViewEnum.TD.value],
+                  [ViewEnum.AD.value]]
+    views_list = [[ViewEnum.TD.value],
+                  [ViewEnum.TN.value],
+                  [ViewEnum.AD.value],
+                  [ViewEnum.AN.value]]
+    auxiliarys_list = [[],
+                       ["ANGLE", "LATITUDE", "LONGITUDE", "ELEVATION", "DOY", "EVI"],
+                       ["LATITUDE", "LONGITUDE", "ELEVATION", "DOY", "EVI"],
+                       ["ANGLE", "LONGITUDE", "ELEVATION", "DOY", "EVI"],
+                       ["ANGLE", "LATITUDE", "ELEVATION", "DOY", "EVI"],
+                       ["ANGLE", "LATITUDE", "LONGITUDE", "DOY", "EVI"],
+                       ["ANGLE", "LATITUDE", "LONGITUDE", "ELEVATION", "EVI"],
+                       ["ANGLE", "LATITUDE", "LONGITUDE", "ELEVATION", "DOY"],
+                       ["LATITUDE", "LONGITUDE", "ELEVATION", "DOY"],
+                       ["ANGLE", "LONGITUDE", "ELEVATION", "DOY"],
+                       ["ANGLE", "LATITUDE", "ELEVATION", "DOY"],
+                       ["ANGLE", "LATITUDE", "LONGITUDE", "DOY"],
+                       ["ANGLE", "LATITUDE", "LONGITUDE", "ELEVATION"]]
+    model_list = [ModelEnum.LINEAR.value, ModelEnum.RANDOM_FOREST.value, ModelEnum.EXTREME_GRADIENT_BOOSTING.value]
+    config.modeling_attribute_list = list(range(1, 25))
+    dataset = Dataset(config)
+    dataset.load_modeling_data(load_validate_data=False)
+    args_list = []
+    for validate_mode in validate_mode_list:
+        config.validate_mode = validate_mode
+        dataset.load_modeling_data(False, True)
+        if validate_mode == ValidateModeEnum.TIME.value:
+            config.train_year_list = list(range(2020, 2023))
+            config.validate_year_list = [2023]
+        for qc_mode in qc_mode_list:
+            config.qc_mode = qc_mode
+            for view_list in views_list:
+                config.view_list = view_list
+                for auxiliary_list in auxiliarys_list:
+                    config.auxiliary_list = auxiliary_list
+                    config.modeling_x_list = build_modeling_x_list(view_list, qc_mode, auxiliary_list)
+                    args_list.append([deepcopy(config), dataset, model_list])
+    concurrent_execute(build_single_model, args_list, pool_size)
+
+
+
+
+def simulate_estimate_ta(config: Configuration, views_list, model_list, x_scalers_list, y_scaler_list):
+    #path = config.path
+    config.validate_mode = ValidateModeEnum.SIMULATE.value
+    dataset = Dataset(config)
+    dataset.load_modeling_data(load_validate_data=False)
+    # modeling_df = dataset.modeling_df
+    # for field in ["LATITUDE", "LONGITUDE", "TEMP", "TD_ALL", "TN_ALL", "AD_ALL", "AN_ALL"]:
+    #     modeling_df[field] = modeling_df[field].map(lambda value: value / 100)
+    executor = GeneralExecutor(config, None, dataset)
+    record_file = os.path.join(record_path, "modeling", f"{config.model}_accuracy.csv")
+    result_df_list = []
+    for index, view_list in enumerate(views_list):
+        executor.model = model_list[index]
+        executor.x_scaler_list = x_scalers_list[index]
+        executor.y_scaler = y_scaler_list[index]
+        modeling_x_list = build_modeling_x_list(view_list, config.qc_mode, config.auxiliary_list)
+        modeling_df = handle_null(dataset.modeling_df, modeling_x_list)
+        executor.pred_x_arr, _, y_arr, _, _ = build_modeling_arr_from_df(modeling_df, modeling_x_list, config.modeling_y, config.std, x_scalers_list[index], y_scaler_list[index])
+        executor.predict(False)
+        dataset.modeling_df = pd.concat([dataset.modeling_df, modeling_df]).drop_duplicates(ColumnsEnum.SINGLE_METE.value, keep=False)
+        result_df_list.append(modeling_df.assign(PRED_TEMP=list(executor.pred_y_arr)))
+        accuracy = Accuracy.validate(y_arr, executor.pred_y_arr, 0.01)
+        view_list_str = ''.join(view.view_name for view in view_list)
+        print(view_list_str, accuracy)
+        record_dict = {"model": [config.model], "view_list": [view_list_str], "qc_mode": [config.qc_mode.name],
+                       "auxiliary_list": [config.auxiliary_list], "modeling_y": [config.modeling_y],
+                       "modeling_attribute_list": [config.modeling_attribute_list],
+                       "validate_mode": [config.validate_mode], "std": [config.std], "validate_count": [accuracy.size],
+                       "validate_r2": [accuracy.r2], "validate_rmse": [accuracy.rmse], "validate_mae": [accuracy.mae],
+                       "validate_bias": [accuracy.bias]}
+        merge_csv(record_file, pd.DataFrame(record_dict), along_column=False)
+    result_df = pd.concat(result_df_list, ignore_index=True)
+    accuracy = Accuracy.validate(result_df["TEMP"].values, result_df["TA"].values, 0.01)
+    to_csv(result_df, os.path.join(estimate_validate_data_path, f"{config.model}_{config.validate_mode}_{config.qc_mode.field}_validate_result.csv"), False)
+    record_dict = {"model": [config.model], "view_list": ["all"], "qc_mode": [config.qc_mode.name],
+                   "auxiliary_list": [config.auxiliary_list], "modeling_y": [config.modeling_y],
+                   "modeling_attribute_list": [config.modeling_attribute_list],
+                   "validate_mode": [config.validate_mode], "std": [config.std], "validate_count": [accuracy.size],
+                   "validate_r2": [accuracy.r2], "validate_rmse": [accuracy.rmse], "validate_mae": [accuracy.mae],
+                   "validate_bias": [accuracy.bias]}
+    print("all", accuracy)
+    merge_csv(record_file, pd.DataFrame(record_dict), along_column=False)
+
+
+def estimate_ta_by_tile(config: Configuration, tile, year, views_list, model_list, x_scalers_list, y_scaler_list, lock=None):
+    #path = config.path
+    qc_mode = config.qc_mode
+    config.modeling_y = "TA"
+    ta_path = os.path.join(estimate_ta_path, tile)
+    create_path(ta_path)
+    dataset = Dataset(config)
+    mask_arr, geo_data = read_raster(os.path.join(mask_path, f"mask_{tile}.tif"))
+    dataset.mask_arr = mask_arr
+    dataset.latitude_arr = read_raster(os.path.join(latitude_path, f"lat_{tile}.tif"))[0]
+    dataset.longitude_arr = read_raster(os.path.join(longitude_path, f"lon_{tile}.tif"))[0]
+    dataset.elevation_arr = read_raster(os.path.join(dem_path, f"dem_{tile}.tif"))[0]
+    executor = GeneralExecutor(config, None, dataset)
+    count = 0
+    record_csv = os.path.join(estimate_record_path, f"estimate_result_{tile}.csv")
+    date_list = get_all_modis_date_by_year(year)
+    if os.path.isfile(record_csv):
+        finished_date = np.unique(pd.read_csv(record_csv)["DATE"].values)
+        finished_date = list(filter(lambda date: (date // 1000) == year, finished_date))
+        count = len(finished_date)
+        date_list = list(filter(lambda modis_date: modis_date.modis_date not in finished_date, date_list))
+    for modis_date in date_list:
+        date = modis_date.modis_date
+        for view in convert_enum_to_value(ViewEnum):
+            view_name = view.view_name
+            lst_file = os.path.join(lst_path, f"{view_name}_{qc_mode.name}", tile, f"{view_name}_{tile}_{qc_mode.name}_{date}.tif")
+            if os.path.isfile(lst_file):
+                setattr(dataset, f"{view_name.lower()}_{qc_mode.field.lower()}_arr", read_raster(lst_file)[0])
+            else:
+                continue
+            angle_file = os.path.join(lst_path, f"{view_name}_angle", tile, f"{view_name}_{tile}_angle_{date}.tif")
+            if os.path.isfile(angle_file):
+                setattr(dataset, f"{view_name.lower()}_angle_arr", read_raster(angle_file)[0])
+        dataset.month_arr = np.full_like(mask_arr, modis_date.month)
+        dataset.doy_arr = np.full_like(mask_arr, modis_date.doy)
+        dataset.ta_arr = np.full_like(mask_arr, NodataEnum.TEMPERATURE.value)
+        result_dict = {"DATE": [date]}
+        for index, view_list in enumerate(views_list):
+            config.modeling_x_list = build_modeling_x_list(view_list, qc_mode, config.auxiliary_list)
+            executor.model = model_list[index]
+            executor.x_scaler_list = x_scalers_list[index]
+            executor.y_scaler = y_scaler_list[index]
+            pixel_count = executor.predict()
+            result_dict["".join(view.view_name for view in view_list)] = pixel_count
+        ta_value_arr = dataset.ta_arr[dataset.ta_arr != NodataEnum.TEMPERATURE.value]
+        result_dict["SUM"] = [ta_value_arr.size]
+        result_dict["MIN_TA"] = result_dict["MAX_TA"] = result_dict["AVG_TA"] = [NodataEnum.TEMPERATURE.value]
+        if ta_value_arr.size > 0:
+            result_dict["MIN_TA"] = np.min(ta_value_arr) / 100
+            result_dict["MAX_TA"] = np.max(ta_value_arr) / 100
+            result_dict["AVG_TA"] = np.average(ta_value_arr) / 100
+            create_raster(os.path.join(ta_path, f"ta_{tile}_{date}.tif"), dataset.ta_arr, geo_data, NodataEnum.TEMPERATURE.value, output_type=gdalconst.GDT_Int16)
+            count += 1
+        to_csv(pd.DataFrame(result_dict), record_csv)
+    to_csv(pd.DataFrame({"tile": [tile], year: [count]}), os.path.join(estimate_ta_path, f"finish_ta_{year}.csv"), lock=lock)
+    print(tile, year, count)
+
+
+def estimate_ta(config: Configuration, pool_size=1):
+    #path = config.path
+    config.modeling_attribute_list = list(range(24, 25)) # ?
+    config.qc_mode = QcModeEnum.ALL.value
+    config.model = ModelEnum.EXTREME_GRADIENT_BOOSTING.value
+    views_list = [[ViewEnum.TD.value, ViewEnum.TN.value, ViewEnum.AD.value, ViewEnum.AN.value],
+                  [ViewEnum.TD.value, ViewEnum.TN.value],
+                  [ViewEnum.AD.value, ViewEnum.AN.value],
+                  [ViewEnum.TN.value],
+                  [ViewEnum.AN.value],
+                  [ViewEnum.TD.value],
+                  [ViewEnum.AD.value]]
+    views_list = [[ViewEnum.AD.value]]
+    config.auxiliary_list = ["ANGLE", "LATITUDE", "LONGITUDE", "ELEVATION", "MONTH", "DOY"]
+    model_list = []
+    x_scalers_list = []
+    y_scaler_list = []
+    model_path = os.path.join(base_model_path, "3years", "24std")
+    for view_list in views_list:
+        view_list_str = ''.join(view.view_name for view in view_list)
+        with open(os.path.join(model_path, f"{config.model}_{view_list_str}_{config.qc_mode.field}.pkl"), "rb") as file:
+            model_list.append(pickle.load(file))
+        if config.std:
+            with open(os.path.join(model_path, f"xscaler_{view_list_str}_{config.qc_mode.field}.pkl"), "rb") as file:
+                x_scalers_list.append(pickle.load(file))
+            with open(os.path.join(model_path, f"yscaler_{view_list_str}_{config.qc_mode.field}.pkl"), "rb") as file:
+                y_scaler_list.append(pickle.load(file))
+        else:
+            x_scalers_list = [None] * len(model_list)
+            y_scaler_list = [None] * len(model_list)
+
+    # simulate_estimate_ta(config, views_list, model_list, x_scalers_list, y_scaler_list)
+    """"""
+    finish_csv = os.path.join(estimate_ta_path, "finish_ta.csv")
+    for year in config.year_list:
+        args_list = []
+        finish_year_csv = os.path.join(estimate_ta_path, f"finish_ta_{year}.csv")
+        for tile in exclude_finished_tile(config.tile_list, year, finish_csv, finish_year_csv):
+            args_list.append([config, tile, year, views_list, model_list, x_scalers_list, y_scaler_list])
+        #concurrent_execute(estimate_ta_by_tile, args_list, pool_size)
+        concurrent_execute(estimate_ta_by_tile, args_list, pool_size)
+        merge_csv(finish_csv, finish_year_csv, "tile", "outer")
+        if os.path.isfile(finish_year_csv):
+            os.remove(finish_year_csv)
+
+
+def modeling_data_statistics(config: Configuration):
+    #path = config.path
+    config.modeling_attribute_list = list(range(1, 25))
+    dataset = Dataset(config).load_modeling_data(load_validate_data=False)
+    modeling_df = dataset.modeling_df
+    record_df_list = []
+    for year, modeling_year_df in modeling_df.groupby("YEAR"):
+        record_dict = {"temp_attribute_list": [config.modeling_attribute_list], "year": [year], "data_size": [modeling_year_df.shape[0]], "station_size": [np.unique(modeling_year_df["STATION"].values).size]}
+        record_df_list.append(pd.DataFrame(record_dict))
+    record_dict = {"temp_attribute_list": [config.modeling_attribute_list], "year": ["all"], "data_size": [modeling_df.shape[0]], "station_size": [np.unique(modeling_df["STATION"].values).size]}
+    record_df_list.append(pd.DataFrame(record_dict))
+    to_csv(pd.concat(record_df_list, ignore_index=True), os.path.join(estimate_modeling_data_path, "modeling_data_statistics.csv"))
+
+
+
+def main():
+    config = Configuration()
+    #config.path = Path()
+    config.modeling_y = "TEMP"
+    config.tile_list = get_world_tile()
+    #config.tile_list = ['h28v05']
+    config.year_list = list(range(2020, 2023))   #range 函数生成的范围是左闭右开的
+    config.std = True
+    config.time_size = 1
+    build_model(config, 1)
+    #estimate_ta(config, 4)
+    #modeling_data_statistics(config)
+
+
+if __name__ == '__main__':
+    main()
